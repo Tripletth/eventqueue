@@ -1,109 +1,125 @@
-#include "dispatch.hpp"
+#include "dispatcher.hpp"
+#include "event.hpp"
 #include "eventqueue.hpp"
 
-#include <cstdlib>
-#include <ctime>
+#include <atomic>
+#include <chrono>
 #include <iostream>
 #include <mutex>
-#include <csignal>
+#include <random>
 #include <string>
+#include <string_view>
 #include <thread>
-#include <unistd.h>
 
 namespace {
-std::mutex mutex{};
+std::mutex cout_mutex{};
 
-constexpr int sec_to_micro(int sec) {
-    return sec * 1000 * 1000;
-}
-
-}
-
-namespace thread1 {
-bool end = false;
-struct message_event : public event_queue::event {
-    message_event(std::string_view m)
-    : event{event_queue::event_type::MESSAGE}, message{m.begin(), m.end()}
-    {}
-    std::string message;
+enum class event_type {
+    MESSAGE,
+    INPUT,
+    OUTPUT
 };
 
-void loop(event_queue* queue) {
-    while(!end) {
-        static int cnt{0};
-        std::string message {"message_"};
-        message += std::to_string(++cnt);
-        queue->push<message_event>(message);
-        usleep(sec_to_micro(1) + std::rand() % sec_to_micro(3));
-    }
-}
-
-void handle(event_queue::event* e) {
-    std::lock_guard<std::mutex> lock{mutex};
-    std::cout << "thread1 event handler: " << static_cast<message_event*>(e)->message << std::endl;
-}
-
-void handle2(event_queue::event* e) {
-    std::lock_guard<std::mutex> lock{mutex};
-    std::cout << "thread1 event handler 2: " << static_cast<message_event*>(e)->message << std::endl;
-}
-}
-
-namespace thread2 {
-bool end = false;
-struct input_event : public event_queue::event {
+struct input_event : public event<event_type> {
     input_event(int i)
-    : event{event_queue::event_type::INPUT}, input{i}
+    : event{event_type::INPUT}, input{i}
     {}
     int input;
 };
 
-void loop(event_queue* queue) {
-    while(!end) {
-        static int cnt{0};
-        queue->push<input_event>(++cnt);
-        usleep(sec_to_micro(1) + std::rand() % sec_to_micro(3));
-    }
-}
+struct message_event : public event<event_type> {
+    message_event(std::string_view m)
+    : event{event_type::MESSAGE}, message{m.begin(), m.end()}
+    {}
+    std::string message;
+};
 
-void handle(event_queue::event* e) {
-    std::lock_guard<std::mutex> lock{mutex};
-    std::cout << "\t\tthread2 event handler: " << static_cast<input_event*>(e)->input << std::endl;
-}
+struct output_event : public event<event_type> {
+    output_event(int i)
+    : event{event_type::OUTPUT}, output{i}
+    {}
+    int output;
+};
+
+class event_generator {
+public:
+    event_generator(std::string_view id, event_type t, event_queue<event_type>* queue, dispatcher<event_type>* dispatch)
+    :id{id}, type{t}, end{false}, queue{queue}, thread{}
+    {}
+    event_generator(event_generator&& e)
+    : id{std::move(e.id)}, type{e.type}, end{e.end.load()}, queue{e.queue}, thread{std::move(e.thread)}
+    {}
+    void start() {
+        thread = std::thread(&event_generator::loop, this);
+    }
+    ~event_generator() {
+        end = true;
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    void loop() {
+        while (!end.load()) {
+            using namespace std::chrono_literals;
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::rand() % 2000));
+
+            {
+                std::lock_guard<std::mutex> lck{cout_mutex};
+                std::cout << "generator [" << id << "] pushing event." << std::endl;
+            }
+
+            static uint64_t cnt{0};
+            if (type == event_type::INPUT) {
+                queue->push<input_event>(++cnt);
+            } else {
+                queue->push<message_event>(id + " message_" + std::to_string(++cnt));
+            }
+        }
+    }
+private:
+    std::string id;
+    event_type type;
+    std::atomic_bool end;
+    event_queue<event_type>* queue;
+    std::thread thread;
+};
 }
 
 int main() {
-    auto interrupt_handler = [](int s){
-        if (s == SIGINT) {
-            thread1::end = true;
-            thread2::end = true;
-            exit(0);
-        }
-    };
-    signal(SIGINT, interrupt_handler);
-
+    constexpr auto nr_of_threads{10};
+    std::vector<event_generator> generators{};
     std::srand(std::time(nullptr));
 
-    event_queue queue{};
-    dispatcher dispatch{};
+    event_queue<event_type> queue{};
+    dispatcher<event_type> dispatch{};
 
-    std::thread t1{thread1::loop, &queue};
-    std::thread t2{thread2::loop, &queue};
+    dispatch.subscribe(event_type::MESSAGE, [](std::unique_ptr<event<event_type>>&& e){
+        std::lock_guard<std::mutex> lck{cout_mutex};
+        std::cout << "\tmessage event: " << static_cast<message_event*>(e.get())->message << std::endl;
+    });
+    dispatch.subscribe(event_type::INPUT, [&queue](std::unique_ptr<event<event_type>>&& e){
+        std::lock_guard<std::mutex> lck{cout_mutex};
+        std::cout << "\t\tinput event: " << static_cast<input_event*>(e.get())->input << ", pushing event. "<< std::endl;
+        queue.push<output_event>(static_cast<input_event*>(e.get())->input);
+    });
+    dispatch.subscribe(event_type::OUTPUT, [](std::unique_ptr<event<event_type>>&& e){
+        std::lock_guard<std::mutex> lck{cout_mutex};
+        std::cout << "\t\t\toutput event after input: " << static_cast<output_event*>(e.get())->output << std::endl;
+    });
 
-    dispatch.subscribe(event_queue::event_type::MESSAGE, thread1::handle);
-    dispatch.subscribe(event_queue::event_type::MESSAGE, thread1::handle2);
-    dispatch.subscribe(event_queue::event_type::INPUT, thread2::handle);
-
-    while(true) {
-        while (!queue.empty()) {
-            auto event = queue.pop();
-            dispatch.dispatch(event.get());
-        }
-        usleep(10000);
+    for (int i = 0; i < nr_of_threads; ++i) {
+        generators.emplace_back(std::to_string(i), (i % 2) ? event_type::INPUT : event_type::MESSAGE, &queue, &dispatch);
     }
 
-    t1.join();
-    t2.join();
+    std::for_each(generators.begin(), generators.end(), [](auto&& generator){
+        generator.start();
+    });
 
+    while(queue.wait_for_event()) {
+        auto event = queue.pop();
+        dispatch.dispatch(std::move(event));
+    }
+
+    generators.clear();
     return 0;
 }
