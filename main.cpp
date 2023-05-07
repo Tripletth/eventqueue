@@ -72,7 +72,7 @@ public:
             if (type == event_type::INPUT) {
                 queue->push<input_event>(++cnt);
             } else {
-                queue->push<message_event>(id + " message_" + std::to_string(++cnt));
+                queue->push<message_event>("message_" + std::to_string(++cnt) + " from " + id);
             }
         }
     }
@@ -93,18 +93,22 @@ int main() {
     event_queue<event_type> queue{};
     dispatcher<event_type> dispatch{};
 
-    dispatch.subscribe(event_type::MESSAGE, [](std::unique_ptr<event<event_type>>&& e){
+    dispatch.subscribe(event_type::MESSAGE, [](const event<event_type>* e){
         std::lock_guard<std::mutex> lck{cout_mutex};
-        std::cout << "\tmessage event: " << static_cast<message_event*>(e.get())->message << std::endl;
+        std::cout << "\tmessage event: " << static_cast<const message_event*>(e)->message << std::endl;
     });
-    dispatch.subscribe(event_type::INPUT, [&queue](std::unique_ptr<event<event_type>>&& e){
+    dispatch.subscribe(event_type::MESSAGE, [](const event<event_type>* e){
         std::lock_guard<std::mutex> lck{cout_mutex};
-        std::cout << "\t\tinput event: " << static_cast<input_event*>(e.get())->input << ", pushing event. "<< std::endl;
-        queue.push<output_event>(static_cast<input_event*>(e.get())->input);
+        std::cout << "\tmessage event in second subscriber: " << static_cast<const message_event*>(e)->message << std::endl;
     });
-    dispatch.subscribe(event_type::OUTPUT, [](std::unique_ptr<event<event_type>>&& e){
+    dispatch.subscribe(event_type::INPUT, [&queue](const event<event_type>* e){
         std::lock_guard<std::mutex> lck{cout_mutex};
-        std::cout << "\t\t\toutput event after input: " << static_cast<output_event*>(e.get())->output << std::endl;
+        std::cout << "\t\tinput event: " << static_cast<const input_event*>(e)->input << ", pushing event. "<< std::endl;
+        queue.push<output_event>(static_cast<const input_event*>(e)->input);
+    });
+    dispatch.subscribe(event_type::OUTPUT, [](const event<event_type>* e){
+        std::lock_guard<std::mutex> lck{cout_mutex};
+        std::cout << "\t\t\toutput event after input: " << static_cast<const output_event*>(e)->output << std::endl;
     });
 
     for (int i = 0; i < nr_of_threads; ++i) {
@@ -117,7 +121,7 @@ int main() {
 
     while(queue.wait_for_event()) {
         auto event = queue.pop();
-        dispatch.dispatch(std::move(event));
+        dispatch.dispatch(event.get());
     }
 
     generators.clear();
